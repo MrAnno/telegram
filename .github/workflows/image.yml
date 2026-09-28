@@ -1,0 +1,126 @@
+name: Image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  BUILDER_IMAGE: dock.mau.dev/tulir/gomuks-build-docker
+  BINARY_NAME: mautrix-telegram
+  GOTOOLCHAIN: local
+  PROJECT_DIR: /builds/mautrix/telegram
+
+jobs:
+  build:
+    name: build + build docker (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            builder_tag: linux-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            builder_tag: linux-arm64-native
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set image name (ghcr.io needs lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mautrix-telegram" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: go-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ matrix.arch }}-
+
+      # Same image, same env and the exact same commands as upstream's `.build` job
+      - name: Build static binary
+        env:
+          CI_COMMIT_SHA: ${{ github.sha }}
+          CI_COMMIT_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          docker run --rm -i \
+            -v "$PWD:$PROJECT_DIR" -w "$PROJECT_DIR" \
+            -e CI_PROJECT_DIR="$PROJECT_DIR" \
+            -e CI_COMMIT_SHA -e CI_COMMIT_TAG -e BINARY_NAME -e GOTOOLCHAIN \
+            "$BUILDER_IMAGE:${{ matrix.builder_tag }}" sh -e <<'SCRIPT'
+          git config --global --add safe.directory "$CI_PROJECT_DIR"
+          mkdir -p .cache
+          export GOPATH="$CI_PROJECT_DIR/.cache"
+          export GOCACHE="$CI_PROJECT_DIR/.cache/build"
+          export MAUTRIX_VERSION=$(cat go.mod | grep 'maunium.net/go/mautrix ' | awk '{ print $2 }')
+          export GO_LDFLAGS="-s -w -linkmode external -extldflags -static -X main.Tag=$CI_COMMIT_TAG -X main.Commit=$CI_COMMIT_SHA -X 'main.BuildTime=`date -Iseconds`' -X 'maunium.net/go/mautrix.GoModVersion=$MAUTRIX_VERSION'"
+          go build -ldflags "$GO_LDFLAGS" -o $BINARY_NAME ./cmd/$BINARY_NAME
+          sha256sum $BINARY_NAME | tee $BINARY_NAME.sha256sum
+          SCRIPT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.arch }}
+          path: |
+            ${{ env.BINARY_NAME }}
+            ${{ env.BINARY_NAME }}.sha256sum
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.arch }} image
+        run: |
+          docker build \
+            --pull \
+            --tag "$IMAGE:$GITHUB_SHA-${{ matrix.arch }}" \
+            . --file Dockerfile.ci
+          docker push "$IMAGE:$GITHUB_SHA-${{ matrix.arch }}"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifests
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mautrix-telegram"
+          AMD64="$IMAGE:$GITHUB_SHA-amd64"
+          ARM64="$IMAGE:$GITHUB_SHA-arm64"
+          docker pull "$AMD64"
+          docker pull "$ARM64"
+
+          if [[ "$GITHUB_REF_TYPE" == "branch" && "$GITHUB_REF_NAME" == "main" ]]; then
+            MANIFEST_NAME="$IMAGE:latest"
+          else
+            MANIFEST_NAME="$IMAGE:${GITHUB_REF_NAME//\//_}"
+          fi
+          docker manifest create "$MANIFEST_NAME" "$AMD64" "$ARM64"
+          docker manifest push "$MANIFEST_NAME"
+
+          # v0.2609.0 -> v26.09, v0.2609.1 -> v26.09.1
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]] && echo "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]{1}\.[0-9]{4}\.[0-9]+$'; then
+            YYMM=$(echo "$GITHUB_REF_NAME" | cut -d. -f2)
+            PATCH=$(echo "$GITHUB_REF_NAME" | cut -d. -f3)
+            YY=${YYMM%??}
+            MM=${YYMM#??}
+            if [ "$PATCH" = "0" ]; then
+              MANIFEST_NAME="$IMAGE:v${YY}.${MM}"
+            else
+              MANIFEST_NAME="$IMAGE:v${YY}.${MM}.${PATCH}"
+            fi
+            docker manifest create "$MANIFEST_NAME" "$AMD64" "$ARM64"
+            docker manifest push "$MANIFEST_NAME"
+            docker manifest rm "$MANIFEST_NAME"
+          fi
